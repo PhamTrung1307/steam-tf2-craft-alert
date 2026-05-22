@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import signal
@@ -10,7 +11,15 @@ from dotenv import load_dotenv
 from flask import Flask, Response
 from werkzeug.serving import make_server
 
-from utils.logger import log, log_error, log_warning
+from utils.logger import (
+    log,
+    log_error,
+    log_item_status,
+    log_scan_header,
+    log_scan_summary,
+    log_warning,
+    safe_print,
+)
 from utils.state_manager import load_state, save_state
 from utils.steam_checker import (
     SteamCheckResult,
@@ -96,15 +105,16 @@ def should_notify(previous_status: Optional[str], current_status: str) -> bool:
     if current_status != "CRAFTABLE":
         return False
 
-    return previous_status != "CRAFTABLE"
+    return previous_status in {"NOT_CRAFTABLE", "UNKNOWN", "ERROR"}
 
 
 def build_message(result: SteamCheckResult) -> str:
     return (
-        "TF2 Craftable Item Alert\n\n"
+        "✅ TF2 Craftable Item Alert\n"
         f"Item: {result.item_name}\n"
         f"Status: {result.status}\n"
-        f"URL: {result.url}"
+        f"URL: {result.url}\n"
+        f"Time: {result.checked_at}"
     )
 
 
@@ -112,12 +122,16 @@ def log_detection_debug(result: SteamCheckResult) -> None:
     log(f"{result.item_name} | FOUND_NOT_CRAFTABLE_PATTERN={result.found_not_craftable_pattern}")
     if result.matched_text:
         log(f"{result.item_name} | MATCHED_TEXT={result.matched_text}")
+    if result.description_text:
+        log(f"{result.item_name} | DESCRIPTION_TEXT={result.description_text}")
+    if result.parsed_json is not None:
+        log(f"{result.item_name} | SSR_RENDER_CONTEXT_PARSED=True")
     if result.anti_bot_detected:
         log_warning(f"{result.item_name} | Possible Steam anti-bot page detected.")
 
     if result.description_html:
         log(f"{result.item_name} | ITEM_DESCRIPTION_HTML_BEGIN")
-        print(result.description_html, flush=True)
+        safe_print(result.description_html)
         log(f"{result.item_name} | ITEM_DESCRIPTION_HTML_END")
     else:
         log_warning(f"{result.item_name} | Item description HTML block not found in response.")
@@ -132,50 +146,62 @@ def run_check_cycle(
     if not links:
         return
 
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    started_monotonic = time.monotonic()
+    counts = {
+        "CRAFTABLE": 0,
+        "NOT_CRAFTABLE": 0,
+        "UNKNOWN": 0,
+        "ERROR": 0,
+    }
+    log_scan_header(started_at, len(links))
+
     state = load_state(STATE_FILE)
     request_delay = int(config["request_delay"])
     request_timeout = int(config["request_timeout"])
+    check_interval = int(config["check_interval"])
     session = create_session()
 
     for index, url in enumerate(links):
         result = check_market_item(url, timeout=request_timeout, session=session)
         previous_status = state.get(url, {}).get("status")
+        counts[result.status] = counts.get(result.status, 0) + 1
 
-        if result.error:
-            log_error(f"{result.item_name} | {result.status} | {result.error}")
-        else:
-            log(f"{result.item_name} | {result.status}")
+        log_item_status(result.status, result.item_name)
+        if result.error and debug:
+            log_error(f"{result.item_name} | {result.error}")
 
         if debug:
             log_detection_debug(result)
 
-        if not result.error:
-            if should_notify(previous_status, result.status):
-                sent = notifier.send_message(build_message(result))
-                if sent:
-                    log(f"Telegram sent | {result.item_name}")
-                else:
-                    log_warning(f"Telegram failed | {result.item_name}")
+        if should_notify(previous_status, result.status):
+            sent = notifier.send_message(build_message(result))
+            if sent:
+                log(f"Telegram sent | {result.item_name}")
+            else:
+                log_warning(f"Telegram failed | {result.item_name}")
 
-            state[url] = {
-                "item_name": result.item_name,
-                "status": result.status,
-                "last_checked_at": result.checked_at,
-                "last_error": None,
-            }
-        else:
-            previous = state.get(url, {})
-            state[url] = {
-                "item_name": result.item_name,
-                "status": previous.get("status", "UNKNOWN"),
-                "last_checked_at": result.checked_at,
-                "last_error": result.error,
-            }
+        state[url] = {
+            "item_name": result.item_name,
+            "status": result.status,
+            "last_checked_at": result.checked_at,
+            "last_error": result.error,
+        }
 
         save_state(state, STATE_FILE)
 
         if index < len(links) - 1:
             time.sleep(request_delay)
+
+    elapsed = time.monotonic() - started_monotonic
+    log_scan_summary(
+        craftable=counts.get("CRAFTABLE", 0),
+        not_craftable=counts.get("NOT_CRAFTABLE", 0),
+        unknown=counts.get("UNKNOWN", 0),
+        errors=counts.get("ERROR", 0),
+        elapsed_seconds=elapsed,
+        next_scan_seconds=check_interval,
+    )
 
 
 def run_monitor(config: Dict[str, object], debug: bool = False) -> None:
@@ -267,10 +293,26 @@ def debug_single(url: str, config: Dict[str, object]) -> None:
     else:
         log_warning("No raw HTML received, debug.html was not written.")
 
+    if result.description_text is not None:
+        with open("debug_text.txt", "w", encoding="utf-8") as file:
+            file.write(result.description_text)
+            file.write("\n")
+        log("Saved normalized description text to debug_text.txt")
+    else:
+        log_warning("No parsed description text, debug_text.txt was not written.")
+
+    if result.parsed_json is not None:
+        with open("debug_parsed.json", "w", encoding="utf-8") as file:
+            json.dump(result.parsed_json, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        log("Saved parsed SSR JSON to debug_parsed.json")
+    else:
+        log_warning("No parsed SSR JSON, debug_parsed.json was not written.")
+
     if result.error:
         log_error(f"{result.item_name} | {result.status} | {result.error}")
     else:
-        log(f"{result.item_name} | {result.status}")
+        log_item_status(result.status, result.item_name)
 
     log_detection_debug(result)
 
@@ -313,7 +355,6 @@ def main() -> None:
     if args.once:
         if not has_required_telegram_env(config):
             log_missing_telegram_env(config)
-            return
 
         notifier = TelegramNotifier(
             token=str(config["telegram_bot_token"]),

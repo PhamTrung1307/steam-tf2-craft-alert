@@ -4,4 +4,6 @@ __pycache__/
 .env
 state.json
 debug.html
+debug_text.txt
+debug_parsed.json
 *.log
