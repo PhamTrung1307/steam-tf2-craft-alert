@@ -52,7 +52,7 @@ def log_scan_header(started_at: str, item_count: int) -> None:
     print(f"===== Scan started {started_at} | {item_count} items =====", flush=True)
 
 
-def log_item_status(status: str, item_name: str) -> None:
+def log_item_status(status: str, item_name: str, parse_method: str = "") -> None:
     icons = {
         "CRAFTABLE": "✅",
         "NOT_CRAFTABLE": "❌",
@@ -65,7 +65,8 @@ def log_item_status(status: str, item_name: str) -> None:
         "UNKNOWN": getattr(Fore, "YELLOW", None),
         "ERROR": getattr(Fore, "YELLOW", None),
     }
-    line = f"{icons.get(status, '??')} {status:<13} | {item_name}"
+    suffix = f" | {parse_method}" if parse_method else ""
+    line = f"{icons.get(status, '??')} {status:<13} | {item_name}{suffix}"
     safe_print(color_text(line, colors.get(status)))
 
 
@@ -83,6 +84,6 @@ def log_scan_summary(
         f"{not_craftable} not craftable, "
         f"{unknown} unknown, "
         f"{errors} errors. "
-        f"Scan took {elapsed_seconds:.2f}s. "
+        f"Duration: {elapsed_seconds:.1f}s. "
         f"Next scan in {next_scan_seconds}s."
     )

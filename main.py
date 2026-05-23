@@ -102,17 +102,19 @@ def read_links(path: str = LINK_FILE) -> List[str]:
 
 
 def should_notify(previous_status: Optional[str], current_status: str) -> bool:
-    if current_status != "CRAFTABLE":
+    if current_status != "CONFIRMED_CRAFTABLE":
         return False
 
-    return previous_status in {"NOT_CRAFTABLE", "UNKNOWN", "ERROR"}
+    return previous_status in {"NOT_CRAFTABLE", "UNKNOWN", "ERROR", None}
 
 
 def build_message(result: SteamCheckResult) -> str:
+    parser = result.used_layout if result.used_layout in {"beta", "classic"} else result.parse_method
     return (
         "✅ TF2 Craftable Item Alert\n"
         f"Item: {result.item_name}\n"
-        f"Status: {result.status}\n"
+        "Status: CONFIRMED_CRAFTABLE\n"
+        f"Parser: {parser}\n"
         f"URL: {result.url}\n"
         f"Time: {result.checked_at}"
     )
@@ -120,6 +122,7 @@ def build_message(result: SteamCheckResult) -> str:
 
 def log_detection_debug(result: SteamCheckResult) -> None:
     log(f"{result.item_name} | FOUND_NOT_CRAFTABLE_PATTERN={result.found_not_craftable_pattern}")
+    log(f"{result.item_name} | PARSER={result.parse_method} | LAYOUT={result.used_layout}")
     if result.matched_text:
         log(f"{result.item_name} | MATCHED_TEXT={result.matched_text}")
     if result.description_text:
@@ -135,6 +138,32 @@ def log_detection_debug(result: SteamCheckResult) -> None:
         log(f"{result.item_name} | ITEM_DESCRIPTION_HTML_END")
     else:
         log_warning(f"{result.item_name} | Item description HTML block not found in response.")
+
+
+def verify_craftable_three_times(
+    url: str,
+    timeout: int,
+    session: object,
+    first_result: SteamCheckResult,
+) -> Optional[SteamCheckResult]:
+    if first_result.status != "CRAFTABLE":
+        return None
+
+    results = [first_result]
+    for _attempt in range(2):
+        time.sleep(5)
+        result = check_market_item(url, timeout=timeout, session=session)
+        results.append(result)
+        if result.status != "CRAFTABLE":
+            log_warning(
+                f"Craftable verification stopped | {result.item_name} | "
+                f"status={result.status} parser={result.parse_method}"
+            )
+            return None
+
+    confirmed = results[-1]
+    confirmed.status = "CONFIRMED_CRAFTABLE"
+    return confirmed
 
 
 def run_check_cycle(
@@ -167,23 +196,30 @@ def run_check_cycle(
         previous_status = state.get(url, {}).get("status")
         counts[result.status] = counts.get(result.status, 0) + 1
 
-        log_item_status(result.status, result.item_name)
+        log_item_status(result.status, result.item_name, result.parse_method)
         if result.error and debug:
             log_error(f"{result.item_name} | {result.error}")
 
         if debug:
             log_detection_debug(result)
 
-        if should_notify(previous_status, result.status):
-            sent = notifier.send_message(build_message(result))
+        notification_result = verify_craftable_three_times(
+            url=url,
+            timeout=request_timeout,
+            session=session,
+            first_result=result,
+        )
+
+        if notification_result and should_notify(previous_status, notification_result.status):
+            sent = notifier.send_message(build_message(notification_result))
             if sent:
-                log(f"Telegram sent | {result.item_name}")
+                log(f"Telegram sent | {notification_result.item_name}")
             else:
-                log_warning(f"Telegram failed | {result.item_name}")
+                log_warning(f"Telegram failed | {notification_result.item_name}")
 
         state[url] = {
             "item_name": result.item_name,
-            "status": result.status,
+            "status": notification_result.status if notification_result else result.status,
             "last_checked_at": result.checked_at,
             "last_error": result.error,
         }
@@ -294,25 +330,36 @@ def debug_single(url: str, config: Dict[str, object]) -> None:
         log_warning("No raw HTML received, debug.html was not written.")
 
     if result.description_text is not None:
-        with open("debug_text.txt", "w", encoding="utf-8") as file:
+        with open("debug_extracted_text.txt", "w", encoding="utf-8") as file:
             file.write(result.description_text)
             file.write("\n")
-        log("Saved normalized description text to debug_text.txt")
+        log("Saved extracted text to debug_extracted_text.txt")
     else:
-        log_warning("No parsed description text, debug_text.txt was not written.")
+        log_warning("No parsed description text, debug_extracted_text.txt was not written.")
 
-    if result.parsed_json is not None:
-        with open("debug_parsed.json", "w", encoding="utf-8") as file:
-            json.dump(result.parsed_json, file, ensure_ascii=False, indent=2)
-            file.write("\n")
-        log("Saved parsed SSR JSON to debug_parsed.json")
-    else:
-        log_warning("No parsed SSR JSON, debug_parsed.json was not written.")
+    debug_result = {
+        "url": url,
+        "expected_item_name_from_url": result.item_name,
+        "parsed_item_name": result.parsed_item_name,
+        "appid": result.appid,
+        "status": result.status,
+        "parse_method": result.parse_method,
+        "found_not_craftable": result.found_not_craftable_pattern,
+        "matched_patterns": result.matched_patterns,
+        "extracted_texts": result.extracted_texts,
+        "request_status_code": result.http_status,
+        "is_antibot_page": result.anti_bot_detected,
+        "used_layout": result.used_layout,
+    }
+    with open("debug_result.json", "w", encoding="utf-8") as file:
+        json.dump(debug_result, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    log("Saved debug result to debug_result.json")
 
     if result.error:
         log_error(f"{result.item_name} | {result.status} | {result.error}")
     else:
-        log_item_status(result.status, result.item_name)
+        log_item_status(result.status, result.item_name, result.parse_method)
 
     log_detection_debug(result)
 
