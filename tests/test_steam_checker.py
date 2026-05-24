@@ -36,7 +36,7 @@ class SteamCheckerParserTests(unittest.TestCase):
         result = detect_status(html, "A Distinctive Lack of Hue")
 
         self.assertEqual(result.status, "NOT_CRAFTABLE")
-        self.assertEqual(result.parse_method, "classic:g_rgAssets")
+        self.assertEqual(result.parse_method, "classic_g_rgAssets")
         self.assertTrue(result.found_not_craftable)
 
     def test_beta_craftable_from_render_context_descriptions(self) -> None:
@@ -75,8 +75,54 @@ class SteamCheckerParserTests(unittest.TestCase):
         result = detect_status(html, "Team Spirit")
 
         self.assertEqual(result.status, "CRAFTABLE")
-        self.assertEqual(result.parse_method, "beta:renderContext")
+        self.assertEqual(result.parse_method, "no_negative_signals")
         self.assertFalse(result.found_not_craftable)
+
+    def test_dom_not_usable_downgrades_beta_craftable(self) -> None:
+        query_data = {
+            "queries": [
+                {
+                    "state": {
+                        "data": {
+                            "pages": [
+                                {
+                                    "listings": [
+                                        {
+                                            "description": {
+                                                "appid": 440,
+                                                "name": "Team Spirit",
+                                                "market_name": "Team Spirit",
+                                                "market_hash_name": "Team Spirit",
+                                                "type": "Level 5 Paint Can",
+                                                "descriptions": [
+                                                    {"value": "Paint Color: Team Spirit"}
+                                                ],
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        }
+        render_context = {"queryData": json.dumps(query_data)}
+        encoded = json.dumps(json.dumps(render_context))
+        html = f"""
+        <script>window.SSR.renderContext = JSON.parse({encoded});</script>
+        <div id="largeiteminfo">
+          <div>Team Spirit</div>
+          <div>( Not Usable in Crafting )</div>
+        </div>
+        """
+
+        result = detect_status(html, "Team Spirit")
+
+        self.assertEqual(result.status, "NOT_CRAFTABLE")
+        self.assertEqual(result.parse_method, "parser_conflict")
+        self.assertTrue(result.parser_conflict_detected)
+        self.assertIn("DOM_visible_text", result.trusted_negative_sources)
 
     def test_parse_fail_is_unknown(self) -> None:
         result = detect_status("<html><body>No market data here.</body></html>", "Pink as Hell")

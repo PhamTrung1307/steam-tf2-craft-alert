@@ -108,6 +108,19 @@ def should_notify(previous_status: Optional[str], current_status: str) -> bool:
     return previous_status in {"NOT_CRAFTABLE", "UNKNOWN", "ERROR", None}
 
 
+def is_safe_craftable_result(result: SteamCheckResult) -> bool:
+    return (
+        result.status == "CRAFTABLE"
+        and not result.found_not_craftable_pattern
+        and not result.trusted_negative_sources
+        and not result.parser_conflict_detected
+        and not result.dom_visible_text_has_not_usable
+        and not result.raw_html_has_not_usable
+        and not result.anti_bot_detected
+        and result.http_status == 200
+    )
+
+
 def build_message(result: SteamCheckResult) -> str:
     parser = result.used_layout if result.used_layout in {"beta", "classic"} else result.parse_method
     return (
@@ -123,6 +136,11 @@ def build_message(result: SteamCheckResult) -> str:
 def log_detection_debug(result: SteamCheckResult) -> None:
     log(f"{result.item_name} | FOUND_NOT_CRAFTABLE_PATTERN={result.found_not_craftable_pattern}")
     log(f"{result.item_name} | PARSER={result.parse_method} | LAYOUT={result.used_layout}")
+    log(f"{result.item_name} | FINAL_DECISION_REASON={result.final_decision_reason}")
+    if result.trusted_negative_sources:
+        log(f"{result.item_name} | TRUSTED_NEGATIVE_SOURCES={','.join(result.trusted_negative_sources)}")
+    if result.parser_conflict_detected:
+        log_warning(f"{result.item_name} | PARSER_CONFLICT_DOWNGRADE_TO_NOT_CRAFTABLE")
     if result.matched_text:
         log(f"{result.item_name} | MATCHED_TEXT={result.matched_text}")
     if result.description_text:
@@ -146,7 +164,7 @@ def verify_craftable_three_times(
     session: object,
     first_result: SteamCheckResult,
 ) -> Optional[SteamCheckResult]:
-    if first_result.status != "CRAFTABLE":
+    if not is_safe_craftable_result(first_result):
         return None
 
     results = [first_result]
@@ -154,15 +172,17 @@ def verify_craftable_three_times(
         time.sleep(5)
         result = check_market_item(url, timeout=timeout, session=session)
         results.append(result)
-        if result.status != "CRAFTABLE":
+        if not is_safe_craftable_result(result):
             log_warning(
                 f"Craftable verification stopped | {result.item_name} | "
-                f"status={result.status} parser={result.parse_method}"
+                f"status={result.status} parser={result.parse_method} "
+                f"reason={result.final_decision_reason}"
             )
             return None
 
     confirmed = results[-1]
     confirmed.status = "CONFIRMED_CRAFTABLE"
+    confirmed.parse_method = "confirmed_3x_no_negative_signals"
     return confirmed
 
 
@@ -194,21 +214,22 @@ def run_check_cycle(
     for index, url in enumerate(links):
         result = check_market_item(url, timeout=request_timeout, session=session)
         previous_status = state.get(url, {}).get("status")
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-        log_item_status(result.status, result.item_name, result.parse_method)
-        if result.error and debug:
-            log_error(f"{result.item_name} | {result.error}")
-
-        if debug:
-            log_detection_debug(result)
-
         notification_result = verify_craftable_three_times(
             url=url,
             timeout=request_timeout,
             session=session,
             first_result=result,
         )
+        display_result = notification_result if notification_result else result
+        count_status = "CRAFTABLE" if display_result.status == "CONFIRMED_CRAFTABLE" else display_result.status
+        counts[count_status] = counts.get(count_status, 0) + 1
+
+        log_item_status(count_status, display_result.item_name, display_result.parse_method)
+        if display_result.error and debug:
+            log_error(f"{display_result.item_name} | {display_result.error}")
+
+        if debug:
+            log_detection_debug(display_result)
 
         if notification_result and should_notify(previous_status, notification_result.status):
             sent = notifier.send_message(build_message(notification_result))
@@ -350,6 +371,12 @@ def debug_single(url: str, config: Dict[str, object]) -> None:
         "request_status_code": result.http_status,
         "is_antibot_page": result.anti_bot_detected,
         "used_layout": result.used_layout,
+        "parser_results": result.parser_results,
+        "trusted_negative_sources": result.trusted_negative_sources,
+        "parser_conflict_detected": result.parser_conflict_detected,
+        "dom_visible_text_has_not_usable": result.dom_visible_text_has_not_usable,
+        "raw_html_has_not_usable": result.raw_html_has_not_usable,
+        "final_decision_reason": result.final_decision_reason,
     }
     with open("debug_result.json", "w", encoding="utf-8") as file:
         json.dump(debug_result, file, ensure_ascii=False, indent=2)

@@ -55,6 +55,45 @@ class ParserResult:
     extracted_texts: List[str] = field(default_factory=list)
     parsed_json: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    parser_results: List[Dict[str, Any]] = field(default_factory=list)
+    trusted_negative_sources: List[str] = field(default_factory=list)
+    parser_conflict_detected: bool = False
+    dom_visible_text_has_not_usable: bool = False
+    raw_html_has_not_usable: bool = False
+    final_decision_reason: str = ""
+
+
+@dataclass
+class SourceSignal:
+    source: str
+    item_name: Optional[str] = None
+    name_match: bool = False
+    appid: Optional[int] = None
+    parsed_ok: bool = False
+    detected_not_usable: bool = False
+    confidence: str = "none"
+    extracted_texts: List[str] = field(default_factory=list)
+    matched_patterns: List[str] = field(default_factory=list)
+    parsed_json: Optional[Dict[str, Any]] = None
+    trusted: bool = True
+    supports_craftable: bool = False
+    error: Optional[str] = None
+
+    def to_debug_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.source,
+            "item_name": self.item_name,
+            "name_match": self.name_match,
+            "appid": self.appid,
+            "parsed_ok": self.parsed_ok,
+            "detected_not_usable": self.detected_not_usable,
+            "confidence": self.confidence,
+            "extracted_texts": self.extracted_texts,
+            "matched_patterns": self.matched_patterns,
+            "trusted": self.trusted,
+            "supports_craftable": self.supports_craftable,
+            "error": self.error,
+        }
 
 
 @dataclass
@@ -76,6 +115,12 @@ class SteamCheckResult:
     appid: Optional[int] = None
     parse_method: str = "parser_failed"
     used_layout: str = "unknown"
+    parser_results: List[Dict[str, Any]] = field(default_factory=list)
+    trusted_negative_sources: List[str] = field(default_factory=list)
+    parser_conflict_detected: bool = False
+    dom_visible_text_has_not_usable: bool = False
+    raw_html_has_not_usable: bool = False
+    final_decision_reason: str = ""
     anti_bot_detected: bool = False
     raw_html: Optional[str] = None
 
@@ -134,6 +179,15 @@ def normalize_text(value: Any) -> str:
     return text.strip()
 
 
+def normalize_raw_html_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = decode_backslash_escapes(text)
+    text = html.unescape(text).lower()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def names_match(candidate: Any, expected_item_name: str) -> bool:
     normalized_candidate = normalize_text(candidate)
     normalized_expected = normalize_text(expected_item_name)
@@ -175,6 +229,28 @@ def extract_description_html(raw_html: str) -> str:
             blocks.append(match.group(0))
 
     return "\n\n".join(blocks)
+
+
+def extract_dom_visible_texts(raw_html: str) -> List[str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+    selectors = [
+        ".market_listing_item_descriptors",
+        "#largeiteminfo",
+        "#largeiteminfo_item_descriptors",
+        "#largeiteminfo_react_placeholder",
+        ".market_listing_iteminfo",
+        "#market_listing_iteminfo",
+        ".market_commodity_order_block",
+        "#market_commodity_order_block",
+        ".descriptor",
+    ]
+    texts: List[str] = []
+    for selector in selectors:
+        for element in soup.select(selector):
+            text = normalize_text(element.get_text(" ", strip=True))
+            if text and text not in texts:
+                texts.append(text)
+    return texts
 
 
 def parse_json_string(value: str) -> Optional[Any]:
@@ -399,10 +475,62 @@ def evaluate_parsed_item(
     )
 
 
-def parse_beta_render_context(raw_html: str, expected_item_name: str) -> ParserResult:
+def build_structured_signal(
+    source: str,
+    candidates: List[Dict[str, Any]],
+    expected_item_name: str,
+    parsed_ok: bool,
+    parsed_json: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> SourceSignal:
+    if not candidates:
+        return SourceSignal(source=source, parsed_ok=False, parsed_json=parsed_json, error=error)
+
+    extracted_texts: List[str] = []
+    matched_patterns: List[str] = []
+    detected_not_usable = False
+    supports_craftable = False
+    first = candidates[0]
+
+    for candidate in candidates:
+        texts = collect_item_texts(candidate)
+        description_texts = collect_description_texts(candidate)
+        extracted_texts.extend(text for text in texts if text and text not in extracted_texts)
+        found, matches = find_not_craftable_in_texts(texts)
+        if found:
+            detected_not_usable = True
+            matched_patterns.extend(match for match in matches if match not in matched_patterns)
+        if (
+            item_appid(candidate) == 440
+            and item_name_matches(candidate, expected_item_name)
+            and description_texts
+        ):
+            supports_craftable = True
+
+    parsed_item_name = first.get("market_hash_name") or first.get("market_name") or first.get("name")
+    appid = item_appid(first)
+    name_match = any(item_name_matches(candidate, expected_item_name) for candidate in candidates)
+    return SourceSignal(
+        source=source,
+        item_name=str(parsed_item_name) if parsed_item_name else None,
+        name_match=name_match,
+        appid=appid,
+        parsed_ok=parsed_ok and name_match,
+        detected_not_usable=detected_not_usable,
+        confidence="high" if name_match and appid == 440 else "medium",
+        extracted_texts=extracted_texts,
+        matched_patterns=matched_patterns,
+        parsed_json=parsed_json,
+        trusted=True,
+        supports_craftable=supports_craftable and not detected_not_usable,
+        error=error,
+    )
+
+
+def beta_render_context_signal(raw_html: str, expected_item_name: str) -> SourceSignal:
     render_context = parse_render_context(raw_html)
     if render_context is None:
-        return ParserResult("UNKNOWN", "parser_failed", "unknown", error="No renderContext")
+        return SourceSignal(source="beta_render_context", error="No renderContext")
 
     query_data = coerce_query_data(render_context)
     candidates: List[Dict[str, Any]] = []
@@ -414,33 +542,28 @@ def parse_beta_render_context(raw_html: str, expected_item_name: str) -> ParserR
         ):
             candidates.append(candidate)
 
-    if not candidates:
-        for candidate in iter_dicts(query_data):
-            description = candidate.get("description")
-            if isinstance(description, dict) and item_name_matches(description, expected_item_name):
-                enriched = dict(description)
-                if "appid" not in enriched and item_appid(candidate) is not None:
-                    enriched["appid"] = item_appid(candidate)
+    for candidate in iter_dicts(query_data):
+        description = candidate.get("description")
+        if isinstance(description, dict) and item_name_matches(description, expected_item_name):
+            enriched = dict(description)
+            if "appid" not in enriched and item_appid(candidate) is not None:
+                enriched["appid"] = item_appid(candidate)
+            if enriched not in candidates:
                 candidates.append(enriched)
 
-    for candidate in candidates:
-        result = evaluate_parsed_item(
-            candidate,
-            expected_item_name,
-            parse_method="beta:renderContext",
-            used_layout="beta",
-            parsed_json=render_context,
-        )
-        if result.status in {"CRAFTABLE", "NOT_CRAFTABLE"}:
-            return result
-
-    return ParserResult(
-        status="UNKNOWN",
-        parse_method="beta:renderContext",
-        used_layout="beta",
+    return build_structured_signal(
+        source="beta_render_context",
+        candidates=candidates,
+        expected_item_name=expected_item_name,
+        parsed_ok=bool(candidates),
         parsed_json=render_context,
-        error="No matching TF2 item description found",
+        error=None if candidates else "No matching TF2 item description found",
     )
+
+
+def parse_beta_render_context(raw_html: str, expected_item_name: str) -> ParserResult:
+    signal = beta_render_context_signal(raw_html, expected_item_name)
+    return parser_result_from_signal(signal, "beta:renderContext", "beta")
 
 
 def get_classic_assets(raw_html: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -485,10 +608,10 @@ def listing_assets(listing_info: Optional[Dict[str, Any]]) -> Iterable[Dict[str,
             yield asset
 
 
-def parse_classic_g_rgAssets(raw_html: str, expected_item_name: str) -> ParserResult:
+def classic_g_rgassets_signal(raw_html: str, expected_item_name: str) -> SourceSignal:
     assets, listing_info = get_classic_assets(raw_html)
     if assets is None:
-        return ParserResult("UNKNOWN", "parser_failed", "unknown", error="No g_rgAssets")
+        return SourceSignal(source="classic_g_rgAssets", error="No g_rgAssets")
 
     candidates: List[Dict[str, Any]] = []
     seen_ids = set()
@@ -511,31 +634,18 @@ def parse_classic_g_rgAssets(raw_html: str, expected_item_name: str) -> ParserRe
     matching_candidates = [
         candidate for candidate in candidates if item_name_matches(candidate, expected_item_name)
     ]
-    if not matching_candidates:
-        return ParserResult(
-            status="UNKNOWN",
-            parse_method="classic:g_rgAssets",
-            used_layout="classic",
-            error="No matching market name in g_rgAssets",
-        )
-
-    for candidate in matching_candidates:
-        result = evaluate_parsed_item(
-            candidate,
-            expected_item_name,
-            parse_method="classic:g_rgAssets",
-            used_layout="classic",
-        )
-        if result.status in {"CRAFTABLE", "NOT_CRAFTABLE"}:
-            return result
-
-    return ParserResult(
-        status="UNKNOWN",
-        parse_method="classic:g_rgAssets",
-        used_layout="classic",
-        extracted_texts=collect_description_texts(matching_candidates[0]),
-        error="Matching classic asset had no usable descriptions",
+    return build_structured_signal(
+        source="classic_g_rgAssets",
+        candidates=matching_candidates,
+        expected_item_name=expected_item_name,
+        parsed_ok=bool(matching_candidates),
+        error=None if matching_candidates else "No matching market name in g_rgAssets",
     )
+
+
+def parse_classic_g_rgAssets(raw_html: str, expected_item_name: str) -> ParserResult:
+    signal = classic_g_rgassets_signal(raw_html, expected_item_name)
+    return parser_result_from_signal(signal, "classic:g_rgAssets", "classic")
 
 
 def find_not_craftable_in_texts(texts: Iterable[str]) -> Tuple[bool, List[str]]:
@@ -549,50 +659,179 @@ def find_not_craftable_in_texts(texts: Iterable[str]) -> Tuple[bool, List[str]]:
     return bool(matches), matches
 
 
-def fallback_raw_scan(raw_html: str) -> ParserResult:
-    description_html = extract_description_html(raw_html)
-    texts = [
-        normalize_text(description_html),
-        normalize_text(html_to_searchable_text(raw_html)),
-        normalize_text(raw_html),
-    ]
+def dom_visible_text_signal(raw_html: str, expected_item_name: str) -> SourceSignal:
+    texts = extract_dom_visible_texts(raw_html)
     found, matches = find_not_craftable_in_texts(texts)
-    if found:
+    combined_text = " ".join(texts)
+    return SourceSignal(
+        source="DOM_visible_text",
+        item_name=expected_item_name if names_match(expected_item_name, expected_item_name) else None,
+        name_match=normalize_text(expected_item_name) in normalize_text(combined_text) if combined_text else False,
+        parsed_ok=bool(texts),
+        detected_not_usable=found,
+        confidence="high" if texts else "none",
+        extracted_texts=texts,
+        matched_patterns=matches,
+        trusted=True,
+        supports_craftable=False,
+        error=None if texts else "No visible DOM description text found",
+    )
+
+
+def raw_html_fallback_signal(raw_html: str) -> SourceSignal:
+    raw_text = normalize_raw_html_text(raw_html) if raw_html else ""
+    matches: List[str] = []
+    excerpts: List[str] = []
+    for pattern in NOT_CRAFTABLE_PATTERNS:
+        for match in pattern.finditer(raw_text):
+            matches.append(match.group(0))
+            start = max(match.start() - 160, 0)
+            end = min(match.end() + 160, len(raw_text))
+            excerpt = raw_text[start:end].strip()
+            if excerpt and excerpt not in excerpts:
+                excerpts.append(excerpt)
+    found = bool(matches)
+    return SourceSignal(
+        source="raw_html_fallback",
+        parsed_ok=bool(raw_html),
+        detected_not_usable=found,
+        confidence="safety" if found else "low",
+        extracted_texts=excerpts,
+        matched_patterns=matches,
+        trusted=True,
+        supports_craftable=False,
+        error=None if raw_html else "Empty HTML",
+    )
+
+
+def parser_result_from_signal(signal: SourceSignal, parse_method: str, used_layout: str) -> ParserResult:
+    status = "UNKNOWN"
+    reason = signal.error or "No conclusive signal"
+    if signal.detected_not_usable:
+        status = "NOT_CRAFTABLE"
+        reason = f"{signal.source} detected not usable"
+    elif signal.supports_craftable:
+        status = "CRAFTABLE"
+        reason = f"{signal.source} supports craftable"
+
+    return ParserResult(
+        status=status,
+        parse_method=parse_method,
+        used_layout=used_layout,
+        parsed_item_name=signal.item_name,
+        appid=signal.appid,
+        found_not_craftable=signal.detected_not_usable,
+        matched_patterns=signal.matched_patterns,
+        extracted_texts=signal.extracted_texts,
+        parsed_json=signal.parsed_json,
+        error=signal.error,
+        parser_results=[signal.to_debug_dict()],
+        trusted_negative_sources=[signal.source] if signal.detected_not_usable else [],
+        dom_visible_text_has_not_usable=signal.source == "DOM_visible_text" and signal.detected_not_usable,
+        raw_html_has_not_usable=signal.source == "raw_html_fallback" and signal.detected_not_usable,
+        final_decision_reason=reason,
+    )
+
+
+def fallback_raw_scan(raw_html: str) -> ParserResult:
+    return parser_result_from_signal(raw_html_fallback_signal(raw_html), "fallback_raw_scan", "unknown")
+
+
+def detect_status(raw_html: str, expected_item_name: str) -> ParserResult:
+    signals = [
+        beta_render_context_signal(raw_html, expected_item_name),
+        classic_g_rgassets_signal(raw_html, expected_item_name),
+        dom_visible_text_signal(raw_html, expected_item_name),
+        raw_html_fallback_signal(raw_html),
+    ]
+    trusted_negative_signals = [
+        signal for signal in signals if signal.trusted and signal.detected_not_usable
+    ]
+    positive_parser_signals = [
+        signal
+        for signal in signals
+        if signal.source in {"beta_render_context", "classic_g_rgAssets"}
+        and signal.supports_craftable
+        and signal.appid == 440
+        and signal.name_match
+        and signal.parsed_ok
+    ]
+    parser_conflict = bool(trusted_negative_signals and positive_parser_signals)
+    parser_results = [signal.to_debug_dict() for signal in signals]
+    extracted_texts: List[str] = []
+    for signal in signals:
+        for text in signal.extracted_texts:
+            if text and text not in extracted_texts:
+                extracted_texts.append(text)
+
+    dom_has_not_usable = any(
+        signal.source == "DOM_visible_text" and signal.detected_not_usable
+        for signal in signals
+    )
+    raw_has_not_usable = any(
+        signal.source == "raw_html_fallback" and signal.detected_not_usable
+        for signal in signals
+    )
+
+    if trusted_negative_signals:
+        source_names = [signal.source for signal in trusted_negative_signals]
+        parse_method = "parser_conflict" if parser_conflict else source_names[0]
+        reason = (
+            "PARSER_CONFLICT_DOWNGRADE_TO_NOT_CRAFTABLE"
+            if parser_conflict
+            else f"trusted_negative_sources={','.join(source_names)}"
+        )
+        first_negative = trusted_negative_signals[0]
         return ParserResult(
             status="NOT_CRAFTABLE",
-            parse_method="fallback_raw_scan",
-            used_layout="unknown",
+            parse_method=parse_method,
+            used_layout=first_negative.source,
+            parsed_item_name=first_negative.item_name,
+            appid=first_negative.appid,
             found_not_craftable=True,
-            matched_patterns=matches,
-            extracted_texts=[text for text in texts if text],
+            matched_patterns=[
+                match
+                for signal in trusted_negative_signals
+                for match in signal.matched_patterns
+            ],
+            extracted_texts=extracted_texts,
+            parsed_json=signals[0].parsed_json,
+            parser_results=parser_results,
+            trusted_negative_sources=source_names,
+            parser_conflict_detected=parser_conflict,
+            dom_visible_text_has_not_usable=dom_has_not_usable,
+            raw_html_has_not_usable=raw_has_not_usable,
+            final_decision_reason=reason,
         )
+
+    if len(positive_parser_signals) == 1 or len(positive_parser_signals) == 2:
+        selected = positive_parser_signals[0]
+        return ParserResult(
+            status="CRAFTABLE",
+            parse_method="no_negative_signals",
+            used_layout=selected.source,
+            parsed_item_name=selected.item_name,
+            appid=selected.appid,
+            extracted_texts=extracted_texts,
+            parsed_json=selected.parsed_json,
+            parser_results=parser_results,
+            dom_visible_text_has_not_usable=dom_has_not_usable,
+            raw_html_has_not_usable=raw_has_not_usable,
+            final_decision_reason="positive parser with zero negative signals",
+        )
+
     return ParserResult(
         status="UNKNOWN",
         parse_method="parser_failed",
         used_layout="unknown",
-        extracted_texts=[text for text in texts if text],
-        error="Beta and classic parsers failed",
+        extracted_texts=extracted_texts,
+        parsed_json=signals[0].parsed_json,
+        error="No positive parser signal and no trusted negative signal",
+        parser_results=parser_results,
+        dom_visible_text_has_not_usable=dom_has_not_usable,
+        raw_html_has_not_usable=raw_has_not_usable,
+        final_decision_reason="no reliable craftable or not craftable decision",
     )
-
-
-def detect_status(raw_html: str, expected_item_name: str) -> ParserResult:
-    beta_result = parse_beta_render_context(raw_html, expected_item_name)
-    if beta_result.used_layout == "beta" and beta_result.status in {"CRAFTABLE", "NOT_CRAFTABLE"}:
-        return beta_result
-
-    classic_result = parse_classic_g_rgAssets(raw_html, expected_item_name)
-    if classic_result.used_layout == "classic" and classic_result.status in {"CRAFTABLE", "NOT_CRAFTABLE"}:
-        return classic_result
-
-    fallback_result = fallback_raw_scan(raw_html)
-    if fallback_result.status == "NOT_CRAFTABLE":
-        return fallback_result
-
-    if beta_result.used_layout == "beta":
-        return beta_result
-    if classic_result.used_layout == "classic":
-        return classic_result
-    return fallback_result
 
 
 def is_anti_bot_page(raw_html: str) -> bool:
@@ -631,6 +870,12 @@ def result_from_parser(
         appid=parser_result.appid,
         parse_method=parser_result.parse_method,
         used_layout=parser_result.used_layout,
+        parser_results=parser_result.parser_results,
+        trusted_negative_sources=parser_result.trusted_negative_sources,
+        parser_conflict_detected=parser_result.parser_conflict_detected,
+        dom_visible_text_has_not_usable=parser_result.dom_visible_text_has_not_usable,
+        raw_html_has_not_usable=parser_result.raw_html_has_not_usable,
+        final_decision_reason=parser_result.final_decision_reason,
         anti_bot_detected=anti_bot_detected,
         raw_html=raw_html if include_html else None,
     )
