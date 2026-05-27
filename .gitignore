@@ -9,3 +9,6 @@ debug_parsed.json
 debug_extracted_text.txt
 debug_result.json
 *.log
+build/
+dist/
+*.spec
